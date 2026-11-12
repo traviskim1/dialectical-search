@@ -38,6 +38,14 @@ ONE ROUND (the spec's steps 4-8)
        backtracks: it names what's in the way as a principle, adds easier actions toward it, and puts
        the original action behind them.
 
+TEMPORARY: PILOT MODE (added 11/12/26 for a one-off test session on 11/13/26; not part of the design)
+    About 15 people try the app for ten minutes each, pretending to be new to an activity. They don't
+    go and do anything, so instead of the feedback steps above (free, guided, general, then close_round)
+    the page asks them to judge each suggestion (the PILOT_* questions) and review_round() moves on as
+    if they had done every card. Their answers are for Travis, to improve the app; the model never
+    sees them. MODE = "study" (or DTR_MODE=study) puts the real flow back; nothing in it was changed.
+    Everything pilot-only is marked PILOT, here and in app.py, and can be deleted once the test is over.
+
 SPEED (none of this changes a prompt or what the model is asked)
     The tree is the slowest call (roughly 25-70 s of a 90 s first round) and needs only the activity's
     name, which the first intake gives. So when there are follow-up questions, the tree is built in a
@@ -56,12 +64,14 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import random
 import re
 import secrets
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -98,6 +108,25 @@ PREFETCH_TREE = True         # build the tree while the person answers the follo
 STATES = ("open", "partial", "done")
 OUTCOMES = ("engaged", "misinterpreted", "afraid", "no_chance", "other")
 FAILURES = ("misinterpreted", "afraid", "other")     # count toward MAX_ATTEMPTS; no_chance doesn't
+
+# ---- TEMPORARY: PILOT MODE (a one-off test session on 11/13/26; see the note at the top of this file) ----
+# "pilot": testers judge the suggestions instead of trying them. "study": the real flow (the spec's).
+# A journal remembers the mode it was started in (j["mode"]), so switching back never breaks an open one.
+MODE = os.getenv("DTR_MODE", "pilot")
+PILOT_INTRO = ("This is a test run of an early version. It takes about 10 minutes. Pick an activity that interests "
+               "you and answer as if you were fairly new to it. You won't be asked to go and do anything: you'll "
+               "get a few suggestions and be asked what you think of them. What you write is used to improve the app.")
+PILOT_RATING = "How much would this suggestion help someone new appreciate {activity} at a deeper level?"
+PILOT_SCALE = "1 = not at all, 5 = a great deal"
+PILOT_HELPS = ("How does this suggestion help, or fail to help, someone appreciate {activity} more or see it in "
+               "a new way?")
+PILOT_INSTEAD = "What would you have liked to see suggested instead?"
+PILOT_DEEPER = ("What is something that would be very helpful for getting you to appreciate {activity} at a deeper "
+                "level, or a suggestion that would help you see it in a new way?")
+PILOT_OTHER = "Anything else? For example, something confusing, too long, too obvious, or missing."
+# ---- end of the pilot settings ----
+
+API_TRIES = 5                # a model call that fails because the service is busy is tried this many times
 
 FREE_QUESTION = "What stood out to you when you did the activity this way? What did you notice?"
 GENERAL_QUESTION = ("Apart from these, did you find other ways you engaged more in the activity, "
@@ -328,14 +357,17 @@ class ClaudeAPIBackend:
         self.input_tokens = self.output_tokens = 0   # running totals, for cost checks
 
     def complete(self, prompt: str, step: str = "", max_tokens: int = 32000) -> str:
-        with self.client.beta.messages.stream(
-            model=self.model, max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"effort": self.effort},
-            # if a safety classifier declines, the API retries on its default fallback model in the same call
-            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-        ) as stream:
-            msg = stream.get_final_message()
+        for attempt in range(1, API_TRIES + 1):
+            try:
+                msg = self._once(prompt, max_tokens)
+                break
+            except Exception as e:   # busy, rate-limited or a dropped connection: wait and try again
+                if attempt == API_TRIES or not self._worth_retrying(e):
+                    raise
+                wait = min(30, 2 ** attempt) + random.random()
+                print(f"  [warn] {step}: {type(e).__name__}; trying again in {wait:.0f}s "
+                      f"(attempt {attempt} of {API_TRIES})", file=sys.stderr)
+                time.sleep(wait)
         self.input_tokens += msg.usage.input_tokens
         self.output_tokens += msg.usage.output_tokens
         if msg.stop_reason == "refusal":
@@ -343,6 +375,30 @@ class ClaudeAPIBackend:
         if msg.stop_reason == "max_tokens":
             print(f"  [warn] {step}: reply hit max_tokens and was cut off", file=sys.stderr)
         return "".join(b.text for b in msg.content if b.type == "text")
+
+    def _once(self, prompt: str, max_tokens: int):
+        with self.client.beta.messages.stream(
+            model=self.model, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"effort": self.effort},
+            # if a safety classifier declines, the API retries on its default fallback model in the same call
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+        ) as stream:
+            return stream.get_final_message()
+
+    @staticmethod
+    def _worth_retrying(e: Exception) -> bool:
+        """True for trouble that passes (too many requests, overloaded, server error, dropped connection);
+        False for a request that would fail again (bad key, bad request)."""
+        import anthropic
+        if isinstance(e, anthropic.APIStatusError):
+            body = e.body if isinstance(e.body, dict) else {}
+            kind = (body.get("error") or {}).get("type") if isinstance(body.get("error"), dict) else ""
+            return (e.status_code in (408, 409, 429) or e.status_code >= 500
+                    or kind in ("overloaded_error", "rate_limit_error", "api_error", "timeout_error"))
+        if isinstance(e, anthropic.AnthropicError):
+            return isinstance(e, anthropic.APIConnectionError)
+        return isinstance(e, OSError) or type(e).__module__.split(".")[0].startswith("http")   # the connection itself
 
 
 class LocalBackend:
@@ -770,7 +826,8 @@ def start(backend, answer: str) -> dict:
     the caller asks them, then calls answer_questions(); otherwise the tree is built right away."""
     j = {"version": 6, "created": now(), "answer": answer, "qa": [], "profile": empty_profile(), "tree": None,
          "rounds": [], "calls": [], "boost": [], "backend": getattr(backend, "model", ""),
-         "key": secrets.token_urlsafe(16)}   # the private link to this journal (?j=key); the slug is guessable
+         "key": secrets.token_urlsafe(16),   # the private link to this journal (?j=key); the slug is guessable
+         "mode": MODE}                       # PILOT (temporary): which flow this journal follows
     data = intake(backend, answer, j=j)
     j["activity"] = str(data.get("activity") or "").strip() or "the activity"
     j["slug"] = unique_slug(j["activity"])
@@ -816,7 +873,9 @@ def fetch_tree(backend, activity: str) -> dict:
     return {"tree": tree, "problems": problems, "calls": log["calls"]}
 
 
-_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="dtr")   # trees built ahead, misses, cards
+# Trees built ahead, misses, cards. Each worker only waits on the model, so many are cheap; 64 covers about
+# 15 people at the same step at once (5 calls each at the busiest), and anything beyond that waits its turn.
+_pool = ThreadPoolExecutor(max_workers=64, thread_name_prefix="dtr")
 _trees: dict[str, Future] = {}   # journal key -> its tree, being built ahead of time
 _TREES_KEPT = 200                # trees of people who never came back are dropped, oldest first
 
@@ -1283,3 +1342,46 @@ def summary_text(j: dict, summary: dict | None) -> list[str]:
         lines.append(f"\"{tree['actions'][b['action']]['name'].rstrip('.')}\" is on hold for now; "
                      f"you'll get some easier steps toward it first.")
     return lines
+
+
+
+# =============================================================================
+# TEMPORARY: PILOT MODE (11/13/26 test session). Delete this section once the test is over.
+# =============================================================================
+def review_round(backend, j: dict) -> dict | None:
+    """PILOT: the tester has judged this round's cards (c["review"], rnd["review"], saved by the page).
+    Move on as if they had done every card, so they see what would come next. The model is not shown
+    what they wrote, and there is no assessment or profile update: nobody actually did the activity."""
+    rnd, tree = current_round(j), j["tree"]
+    ahead = start_misses(backend, j)
+    for c in rnd["cards"]:
+        c["outcome"] = "reviewed"
+        tree["actions"][c["action"]]["state"] = "done"
+    rnd["summary"], rnd["closed"] = {"pilot": True}, now()
+    nxt = plan_round(backend, j, ahead=ahead)
+    save(j)
+    return nxt
+
+
+def pilot_rows() -> list[dict]:
+    """PILOT: every suggestion shown in a pilot journal, with what the tester said about it. One row per card."""
+    rows = []
+    for j in export_all():
+        if j.get("mode") != "pilot" or not j.get("tree"):
+            continue
+        tree = j["tree"]
+        for rnd in j.get("rounds", []):
+            general = rnd.get("review") or {}
+            for n, c in enumerate(rnd["cards"], 1):
+                a, p, rv = tree["actions"][c["action"]], tree["principles"][c["principle"]], c.get("review") or {}
+                rows.append({
+                    "journal": j["slug"], "activity": j["activity"], "started": j["created"],
+                    "first_answer": j["answer"], "level": j["profile"]["level"],
+                    "round": rnd["number"], "card": n, "action": a["name"], "called": a.get("called", ""),
+                    "card_title": c["card"].get("title", ""), "value": tree["values"][p["value"]]["name"],
+                    "principle": p["name"], "impact": a.get("impact", ""), "overall_difficulty": a["overall"],
+                    "principle_difficulty": a["principle"], "why_chosen": c.get("why_chosen", ""),
+                    "rating": rv.get("rating", ""), "helps": rv.get("helps", ""), "instead": rv.get("instead", ""),
+                    "round_deeper": general.get("deeper", ""), "round_other": general.get("other", ""),
+                    "finished": j.get("finished", "")})
+    return rows

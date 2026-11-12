@@ -9,6 +9,18 @@ becomes a round chosen by gaps in a user profile. What v6 kept from v5:
 - the rule that the app knows no activity (enforced by a test);
 - the card write-up style (scene / normally / steps / why), trimmed.
 
+## TEMPORARY: pilot mode (added 2026-11-12 for a test session on 2026-11-13)
+
+**This is not part of the design. Read this before changing the feedback steps.** On 2026-11-13 about 15 people try the app for ten minutes each. They pick an activity, pretend to be fairly new to it, and never go and do anything. So for now the page asks them to judge the suggestions, and their answers go to Travis to improve the app across activities.
+
+- **What a tester sees.** A note above the search box (`PILOT_INTRO`), then the normal intake, questions and cards. Under the cards, in place of the free / guided / general feedback: per card a 1-5 rating (`PILOT_RATING`), "how does this help or fail to help" (`PILOT_HELPS`) and "what would you have liked to see instead" (`PILOT_INSTEAD`); then two overall questions (`PILOT_DEEPER`, `PILOT_OTHER`). "Save and see the next suggestions" calls `review_round()`; "Save and finish" ends with a thank-you.
+- **What `review_round()` does.** It marks every card on the round as done, as if the tester had tried it, and plans the next round. No assess, no guided questions, no profile update. The model is never shown what testers wrote (a test checks this), so the next round is what a person who engaged with everything would get.
+- **Where the answers are.** In the journal: `card["review"]` (`rating`, `helps`, `instead`) and `round["review"]` (`deeper`, `other`). The researcher sidebar has "Download tester feedback (CSV)" (`pilot_rows()`): one row per suggestion shown, with its place in the tree, its ratings and what was written.
+- **The switch.** `MODE` in `value_tree.py`, default `"pilot"`; `DTR_MODE=study` (env var or Streamlit secret) or `MODE = "study"` brings the real flow back. A journal keeps the mode it was started in (`j["mode"]`), so journals from before the pilot (no `mode`) and study journals are unaffected. The real flow's code (`ask_guided`, `close_round`, the free and guided forms) was not changed.
+- **Removing it after the test.** Everything pilot-only is marked `PILOT`: the settings block and the last section of `value_tree.py`, the `"mode"` line in `start()`, the marked parts of `app.py`, three tests, `DTR_MODE` in `env.example`, this section, and the last entry in the spec's change list. Export the tester feedback first.
+
+Kept after the pilot (not temporary): `ClaudeAPIBackend` tries a call again when the service is busy (`API_TRIES`), the page shows a plain "press the button again" message when a model step fails (`model_step`), and a round with no cards left ends with a message.
+
 ## Files
 
 | File | What it is |
@@ -92,6 +104,16 @@ Changes that alter what the model is given (2026-11-12, Travis's choice):
 Tried and undone: **merging miss and locate into one call** (2026-11-12). With the principle list in view, the answers started reusing the list's wording, which defeats the point of a separate query. Running the two calls in the background costs nothing extra when a round closes and at most ~4 s on the first round, and only when the tree had already finished before the person continued.
 
 Calls made in the background are logged when they are collected; `calls` is kept in time order (`log_calls`). Still one after another, because each needs the one before: assess → update, and choose → expand. Lower effort for the small steps is the remaining untried option.
+
+## Many people at once
+
+Checked on 2026-11-12 for the 15-person pilot.
+
+- **The API account's limits** for Sonnet 5.5 are 4,000 requests, 2,000,000 input tokens and 400,000 output tokens a minute (read from the response headers). Fifteen people starting in the same minute use about 100 requests and 100,000 output tokens, so there is no queue to manage.
+- **Busy or dropped calls** are tried again up to `API_TRIES` times with growing waits, on top of the SDK's own retries. A bad key or a bad request fails at once.
+- **One process serves everyone** on Streamlit Cloud: each visitor is a thread, background calls share a 64-worker pool, and the database is one kept-open connection behind a lock (a statement takes ~30 ms, so people queue for it unnoticeably).
+- **Simulated load.** 15 and then 40 people at once, with a slowed-down mock model and a local Postgres, each going through intake, questions and two reviewed rounds: all finished, no errors, nothing stuck, and every journal held only its own person's data.
+- **Things only the day can show:** Streamlit Cloud's free tier has about 1 GB of memory and puts an unused app to sleep, so open the app a few minutes before people arrive. If the app shows old behaviour after a push, use Manage app → Reboot app (a push on 2026-11-12 was not picked up until a reboot).
 
 ## Choices the spec left open (ask Travis before changing)
 

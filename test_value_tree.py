@@ -293,6 +293,66 @@ def test_a_card_that_fails_keeps_the_trees_write_up():
         assert c["card"]["id"] == c["action"] and c["card"]["title"] == j["tree"]["actions"][c["action"]]["name"]
 
 
+# ---- TEMPORARY: PILOT MODE (11/13/26 test session). Delete with the pilot code. ----
+def test_pilot_review_moves_on_without_showing_the_model_what_was_written():
+    b, j = started()
+    assert j["mode"] == vt.MODE == "pilot"
+    first = vt.current_round(j)
+    for c in first["cards"]:
+        c["review"] = {"rating": 2, "helps": "REVIEW-TEXT too obvious", "instead": "REVIEW-TEXT something else"}
+    first["review"] = {"deeper": "REVIEW-TEXT a deeper thing", "other": ""}
+    before = len(j["calls"])
+    nxt = vt.review_round(b, j)
+    assert first["closed"] and all(j["tree"]["actions"][c["action"]]["state"] == "done" for c in first["cards"])
+    assert nxt["number"] == 2 and nxt["cards"]
+    assert not {c["action"] for c in nxt["cards"]} & {c["action"] for c in first["cards"]}
+    new_calls = j["calls"][before:]
+    assert not any(c["step"].startswith(("assess", "update", "guided")) for c in new_calls)
+    assert not any("REVIEW-TEXT" in c["prompt"] for c in new_calls), "reviews are for the researcher only"
+    back = vt.load(j["slug"])
+    assert back["rounds"][0]["cards"][0]["review"]["rating"] == 2
+    rows = [r for r in vt.pilot_rows() if r["journal"] == j["slug"]]
+    assert len(rows) == len(first["cards"]) + len(nxt["cards"])
+    assert rows[0]["rating"] == 2 and rows[0]["round_deeper"] == "REVIEW-TEXT a deeper thing" and rows[-1]["rating"] == ""
+
+
+def test_pilot_rounds_end_cleanly_when_nothing_is_left():
+    b, j = started()
+    for _ in range(30):
+        if not vt.current_round(j)["cards"]:
+            break
+        vt.review_round(b, j)
+    assert vt.current_round(j)["cards"] == [], "an empty round, not an error, once nothing is within reach"
+
+
+def test_api_backend_waits_and_tries_again_when_the_service_is_busy(monkeypatch):
+    anthropic = pytest.importorskip("anthropic")
+    httpx = pytest.importorskip("httpx2")   # the HTTP library the SDK uses
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(vt.time, "sleep", lambda s: None)
+    b = vt.ClaudeAPIBackend("some-model")
+
+    class Msg:
+        stop_reason, content = "end_turn", [type("T", (), {"type": "text", "text": "ok"})()]
+        usage = type("U", (), {"input_tokens": 1, "output_tokens": 1})()
+
+    def error(status, kind):
+        resp = httpx.Response(status, request=httpx.Request("POST", "https://example.invalid"))
+        return anthropic.APIStatusError("busy", response=resp, body={"type": "error", "error": {"type": kind}})
+
+    queue = [error(529, "overloaded_error"), error(200, "overloaded_error"), error(429, "rate_limit_error"), Msg()]
+    def once(prompt, max_tokens):
+        x = queue.pop(0)
+        if isinstance(x, Exception):
+            raise x
+        return x
+    b._once = once
+    assert b.complete("hi", step="test") == "ok" and not queue
+    b._once = lambda prompt, max_tokens: (_ for _ in ()).throw(error(401, "authentication_error"))
+    with pytest.raises(anthropic.APIStatusError):
+        b.complete("hi", step="test")          # a bad key fails at once; it would only fail again
+
+
 def test_a_failed_early_tree_is_asked_for_again():
     b = MockBackend()
     j = vt.start(b, "I'm getting into it. I already do the obvious thing.")
