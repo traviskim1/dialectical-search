@@ -1,0 +1,6 @@
+anthropic>=2.8     # the Claude API backend (the default)
+openai             # only as a client for a local OpenAI-compatible server (Ollama / LM Studio)
+psycopg[binary]    # the Postgres journal store (only used when DATABASE_URL is set)
+python-dotenv      # optional: read settings from .env
+streamlit>=1.45    # the website (app.py)
+pytest             # optional: `pytest -q` runs test_value_tree.py

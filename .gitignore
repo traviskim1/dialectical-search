@@ -1,0 +1,9 @@
+.env
+journals/
+runs/
+evals/results/
+__pycache__/
+.pytest_cache/
+.streamlit/secrets.toml
+.mcp.json
+.claude/
