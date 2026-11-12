@@ -27,11 +27,13 @@ gets. Everything pilot-only is marked PILOT.
 
 import csv
 import hmac
+import importlib
 import io
 import json
 import os
 import re
 import sys
+import threading
 import traceback
 
 import streamlit as st
@@ -39,6 +41,26 @@ import streamlit as st
 import value_tree as vt
 
 st.set_page_config(page_title="Dialectical Search", layout="centered")
+
+
+def reload_changed_modules() -> None:
+    """After a push, Streamlit Cloud runs the new app.py but keeps the modules it had already imported, so
+    the page ran against an old value_tree (seen twice on 11/12/26: stale behaviour, then an error). Reload
+    a module of ours whenever its file has changed since it was loaded, and drop anything cached from it."""
+    lock = sys.__dict__.setdefault("_dtr_reload_lock", threading.Lock())   # one lock for every visitor
+    with lock:
+        for name in ("value_tree", "mock_backend"):
+            module = sys.modules.get(name)
+            if module is None:
+                continue
+            changed = os.path.getmtime(module.__file__)
+            if getattr(module, "_file_time", None) != changed:
+                importlib.reload(module)
+                module._file_time = changed
+                st.cache_resource.clear()
+
+
+reload_changed_modules()
 
 BACKENDS = {"Claude API (default)": "api", "Ollama (local)": "local", "Claude (my plan, just me)": "claude",
             "Mock (no model, for testing)": "mock"}

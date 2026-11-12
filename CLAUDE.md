@@ -113,7 +113,7 @@ Checked on 2026-11-12 for the 15-person pilot.
 - **Busy or dropped calls** are tried again up to `API_TRIES` times with growing waits, on top of the SDK's own retries. A bad key or a bad request fails at once.
 - **One process serves everyone** on Streamlit Cloud: each visitor is a thread, background calls share a 64-worker pool, and the database is one kept-open connection behind a lock (a statement takes ~30 ms, so people queue for it unnoticeably).
 - **Simulated load.** 15 and then 40 people at once, with a slowed-down mock model and a local Postgres, each going through intake, questions and two reviewed rounds: all finished, no errors, nothing stuck, and every journal held only its own person's data.
-- **Things only the day can show:** Streamlit Cloud's free tier has about 1 GB of memory and puts an unused app to sleep, so open the app a few minutes before people arrive. If the app shows old behaviour after a push, use Manage app → Reboot app (a push on 2026-11-12 was not picked up until a reboot).
+- **Things only the day can show:** Streamlit Cloud's free tier has about 1 GB of memory and puts an unused app to sleep, so open the app a few minutes before people arrive. After a push, Streamlit Cloud runs the new `app.py` but keeps modules it already imported; on 2026-11-12 that left the live app on an old `value_tree` (stale behaviour once, an error once). `reload_changed_modules()` at the top of `app.py` now reloads `value_tree` when its file has changed. If the app still looks wrong after a push, use Manage app → Reboot app. Don't push during a session with people in it: a reload drops trees being built ahead.
 
 ## Choices the spec left open (ask Travis before changing)
 
