@@ -343,6 +343,8 @@ if pilot and j.get("finished"):   # PILOT
     st.stop()
 
 st.subheader(f"Round {rnd['number']}: " + ("suggestions" if pilot else "try these the next time you do it"))
+if pilot and rnd["number"] > 1:   # PILOT: say that the app moved on as if they had done the last round
+    st.info(vt.PILOT_MOVED_ON)
 for c in rnd["cards"]:
     show_card(c)
 
@@ -371,6 +373,7 @@ if pilot:
         deeper = st.text_area(vt.fill(vt.PILOT_DEEPER, activity=activity), value=general.get("deeper", ""),
                               height=110, key=f"deeper-{rnd['number']}")
         other = st.text_area(vt.PILOT_OTHER, value=general.get("other", ""), height=90, key=f"other-{rnd['number']}")
+        st.caption(vt.PILOT_NEXT)
         col1, col2 = st.columns(2)
         finish = col1.form_submit_button("Save and finish")
         more = col2.form_submit_button("Save and see the next suggestions", type="primary")

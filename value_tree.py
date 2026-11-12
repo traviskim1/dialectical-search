@@ -124,6 +124,11 @@ PILOT_INSTEAD = "What would you have liked to see suggested instead?"
 PILOT_DEEPER = ("What is something that would be very helpful for getting you to appreciate {activity} at a deeper "
                 "level, or a suggestion that would help you see it in a new way?")
 PILOT_OTHER = "Anything else? For example, something confusing, too long, too obvious, or missing."
+# said before they ask for the next round, and again above it: nobody did the activity, so the app pretends
+PILOT_NEXT = ("The next suggestions will be chosen as if you had gone and done all of the ones above, so they "
+              "move on from these.")
+PILOT_MOVED_ON = ("These suggestions assume you went and did everything suggested in the last round. The app is "
+                  "moving on as if you had, so that you can see what it would suggest next.")
 # ---- end of the pilot settings ----
 
 API_TRIES = 5                # a model call that fails because the service is busy is tried this many times
