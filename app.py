@@ -22,6 +22,7 @@ Participants use the backend in DTR_BACKEND (default: local).
 import hmac
 import json
 import os
+import re
 
 import streamlit as st
 
@@ -33,14 +34,23 @@ BACKENDS = {"Claude API (default)": "api", "Ollama (local)": "local", "Claude (m
             "Mock (no model, for testing)": "mock"}
 
 
+SECRETS_PROBLEM = ""   # why the Streamlit secrets couldn't be read, without any secret values
+
+
 def setting(name: str, default: str = "") -> str:
     """An env var, or a Streamlit secret of the same name (for hosted deploys)."""
+    global SECRETS_PROBLEM
     if os.getenv(name):
         return os.environ[name]
     try:
-        return str(st.secrets.get(name, default))
-    except Exception:   # no secrets file
+        value = st.secrets.get(name)
+    except FileNotFoundError:   # no secrets at all (normal locally, where .env is used)
         return default
+    except Exception as e:      # usually the Secrets box isn't valid TOML (e.g. KEY=value without quotes)
+        where = re.search(r"line \d+(, column \d+)?", str(e))
+        SECRETS_PROBLEM = f"{type(e).__name__}" + (f" at {where.group(0)}" if where else "")
+        return default
+    return default if value is None else str(value)
 
 
 # hosted deploys keep keys in Streamlit secrets; value_tree and the SDKs read the environment
@@ -57,6 +67,17 @@ DEFAULT_MODELS = {"api": os.getenv("API_MODEL", "claude-sonnet-5-5"), "local": o
 def backend():
     kind = st.session_state.get("backend_kind", PUBLIC_BACKEND)
     return vt.make_backend(kind, st.session_state.get("model") or DEFAULT_MODELS[kind])
+
+
+def setup_problem() -> str:
+    """What's missing for the participant backend, in words safe to show anyone (no secret values)."""
+    if st.session_state.get("backend_kind", PUBLIC_BACKEND) != "api" or os.getenv("ANTHROPIC_API_KEY"):
+        return ""
+    if SECRETS_PROBLEM:
+        return (f"The app's Secrets couldn't be read ({SECRETS_PROBLEM}). They must be TOML, with every value "
+                f'in quotes: ANTHROPIC_API_KEY = "sk-ant-..."')
+    return ('The app has no ANTHROPIC_API_KEY. In Manage app → Settings → Secrets, add it as TOML, with the value '
+            'in quotes and at the top level (not under a [section]): ANTHROPIC_API_KEY = "sk-ant-..."')
 
 
 def busy(label: str):
@@ -144,6 +165,9 @@ if researcher:
 
 # ---- 1. the search box -----------------------------------------------------------------------
 st.title("Dialectical Search")
+if setup_problem():
+    st.error(setup_problem())
+    st.stop()
 slug = st.session_state.get("slug")
 
 if not slug:
