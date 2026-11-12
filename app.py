@@ -16,7 +16,7 @@ Privacy: participants see no sidebar and can only reach their own journal, throu
 (?j=<key>, set after the first answer; bookmark it to come back). The sidebar (backend, every journal,
 the researcher view of the hidden tree and profile) appears only on ?researcher=1 after entering
 RESEARCHER_PASSWORD (env var or Streamlit secret). With no password set, it can't be unlocked.
-Participants use the backend in DTR_BACKEND (default: local).
+Participants use the backend in DTR_BACKEND (default: api).
 """
 
 import hmac
@@ -64,9 +64,16 @@ DEFAULT_MODELS = {"api": os.getenv("API_MODEL", "claude-sonnet-5-5"), "local": o
                   "claude": os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5"), "mock": "mock"}
 
 
+@st.cache_resource(show_spinner=False)
+def make_backend(kind: str, model: str):
+    """One backend per (kind, model), shared by everyone, so its connection to the model stays open
+    instead of being set up again on every click."""
+    return vt.make_backend(kind, model)
+
+
 def backend():
     kind = st.session_state.get("backend_kind", PUBLIC_BACKEND)
-    return vt.make_backend(kind, st.session_state.get("model") or DEFAULT_MODELS[kind])
+    return make_backend(kind, st.session_state.get("model") or DEFAULT_MODELS[kind])
 
 
 def setup_problem() -> str:

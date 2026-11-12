@@ -79,7 +79,7 @@ REPLIES = {
     "update": _update,
     "miss": lambda p: json.dumps({"misses": ["the part away from the obvious thing", "the second part"]}),
     "locate misses": lambda p: json.dumps({"located": [{"item": 1, "principle": "p3"}, {"item": 2, "principle": "p5"}]}),
-    "choose": lambda p: json.dumps({"chosen": [{"id": i, "why": "mock"} for i in _ids(p)]}),
+    "choose": lambda p: json.dumps({"chosen": [{"id": i, "why": "mock", "moment": f"the moment for {i}"} for i in _ids(p)]}),
     "expand": lambda p: json.dumps({"cards": [{"id": i, "title": f"Do {i}", "called": "", "scene": ["Imagine you're there."],
                                               "normally": "Normally, you might wait.", "steps": ["1. Do it."], "key": "Do it.",
                                               "why": ["Because."], "fits": "Part of something bigger.",

@@ -26,8 +26,9 @@ ONE ROUND (the spec's steps 4-8)
     1. score every principle: gap = 1 - (done + 0.5*partial) / number of actions under it
        blend with the "what do people like this usually miss?" query, weighted by
        MISS_WEIGHT / (1 + rounds already closed): heavy at the start, lighter as context builds
-    2. shortlist open actions under the top principles that are within reach
-       (overall <= level + STRETCH and principle <= that principle's level + STRETCH)
+    2. shortlist open actions that are within reach (overall <= level + AWARENESS + STRETCH and
+       principle <= that principle's level + AWARENESS + STRETCH), from every principle, ranked by the
+       principle's score plus the action's impact
     3. the model picks 2-3 from the shortlist using the misc details, and writes each card
     4. after doing the activity: free feedback per card, then guided questions per card,
        then general feedback
@@ -36,6 +37,18 @@ ONE ROUND (the spec's steps 4-8)
        A failed action comes back next round with that reply. After MAX_ATTEMPTS failures the app
        backtracks: it names what's in the way as a principle, adds easier actions toward it, and puts
        the original action behind them.
+
+SPEED (none of this changes a prompt or what the model is asked)
+    The tree is the slowest call (roughly 25-70 s of a 90 s first round) and needs only the activity's
+    name, which the first intake gives. So when there are follow-up questions, the tree is built in a
+    background thread while the person answers them (PREFETCH_TREE). The database connection is kept
+    open between calls.
+    Three more, which did change what the model is given (Travis's choice, 11/12/26):
+      - the "usually miss" query (and then placing its answers on the tree) runs in the background
+        alongside the profile update, so it reads the profile as it was before the update;
+      - each card is written in its own call, all at the same time. So that the cards don't collide,
+        the choose call gives each action its own moment, a retried action keeps the scene it had, and
+        every card call is given all the moments.
 """
 
 from __future__ import annotations
@@ -48,6 +61,8 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 try:
@@ -79,6 +94,7 @@ MISSES_ASKED = 6
 PARTIAL_CREDIT = 0.5         # a partial (downweighted) action counts this much toward a principle's coverage
 SHORTLIST = 8
 MAX_ATTEMPTS = 3             # failed tries of one action before backtracking
+PREFETCH_TREE = True         # build the tree while the person answers the follow-up questions (same call, started earlier)
 STATES = ("open", "partial", "done")
 OUTCOMES = ("engaged", "misinterpreted", "afraid", "no_chance", "other")
 FAILURES = ("misinterpreted", "afraid", "other")     # count toward MAX_ATTEMPTS; no_chance doesn't
@@ -195,11 +211,13 @@ PROMPT_CHOOSE = """Someone is getting into {activity}. What we know about them:
 These actions come from the parts of {activity} they engage with least, and are within reach of their experience:
 {shortlist}
 
-Choose {n} for them to try the next time they do {activity}. Prefer high-impact actions: ones that change how {activity} goes for them and the people they do it with, so they see that what they are doing does a lot of good for their goals and for {activity} itself. Among actions of similar impact, prefer the less obvious ones, ones they are unlikely to have thought of or been told already; assume they know a bit more about {activity} than what we know about them shows. Prefer actions that are a small stretch rather than none, that suit their particular details (body, setting, who they do it with), and that they can do in the way they actually do {activity}. Two from the same principle are fine when they work together."""
+Choose {n} for them to try the next time they do {activity}. Prefer high-impact actions: ones that change how {activity} goes for them and the people they do it with, so they see that what they are doing does a lot of good for their goals and for {activity} itself. Among actions of similar impact, prefer the less obvious ones, ones they are unlikely to have thought of or been told already; assume they know a bit more about {activity} than what we know about them shows. Prefer actions that are a small stretch rather than none, that suit their particular details (body, setting, who they do it with), and that they can do in the way they actually do {activity}. Two from the same principle are fine when they work together.
+
+For each one you choose, also give a "moment": one line naming a specific moment, in the way they actually do {activity}, where that action is the thing to do: where they are, who or what is around them, what just happened. Each one's card will be set in its moment, so the moments must be clearly different from each other{taken}."""
 
 PROMPT_CHOOSE_FORMAT = """
 
-Return only JSON: {"chosen": [{"id": "a7", "why": "one sentence for the researcher's log: why this action, for this person"}]}"""
+Return only JSON: {"chosen": [{"id": "a7", "why": "one sentence for the researcher's log: why this action, for this person", "moment": "one line"}]}"""
 
 PROMPT_EXPAND = """You have done {activity} for years, and you're helping a friend who's newer to it.
 What you know about them:
@@ -208,10 +226,10 @@ What you know about them:
 This time you're giving them these to try:
 {items}
 
-Write each one up so they could do it the next time they do {activity} without asking you anything: plain words, short sentences, one idea per line. The only special word on a card is the action's own name, if it has one, explained once in one sentence.
+Write up {this}{others} so they could do it the next time they do {activity} without asking you anything: plain words, short sentences, one idea per line. The only special word on a card is the action's own name, if it has one, explained once in one sentence.
 - "title": the action, as a short instruction (under 10 words). If the action has a name people use, the title uses that name ("Set a X ..."), not a description of it; otherwise plain words.
 - "called": if the action has a name people use, one sentence: "This is called a X: ..." in plain words. Otherwise "".
-- "scene": one specific moment where they could do it, the way they actually do {activity}: start with "Imagine you're", then 2-4 short lines on where they are, what's around them (other people by their role in that moment, never by an invented name; or, alone, what's in front of them) and what just happened.
+- "scene": one specific moment where they could do it, the way they actually do {activity}: start with "Imagine you're", then 2-4 short lines on where they are, what's around them (other people by their role in that moment, never by an invented name; or, alone, what's in front of them) and what just happened. When a moment is given with the action, the scene is that moment, and it must not read like the moments given with the other actions.
 - "normally": "Normally, you might ..." (what someone at their level would do in that moment).
 - "steps": 3-5 short numbered steps that refer to the scene, each easy to remember in the middle of {activity}.
 - "key": one sentence on the single thing that's different from what they'd normally do.
@@ -225,7 +243,7 @@ Don't tell them what they'll feel, enjoy or value, and don't promise they'll imp
 PROMPT_EXPAND_FORMAT = """
 
 Return only JSON:
-{"cards": [{"id": "the id given above", "title": "...", "called": "", "scene": ["Imagine you're ...", "..."], "normally": "Normally, you might ...", "steps": ["..."], "key": "...", "why": ["..."], "fits": "...", "enough": "You don't need to ...", "experiment": ["Try it when ..."], "watch": ""}]}"""
+{"cards": [{"id": "the id of the one you are writing up", "title": "...", "called": "", "scene": ["Imagine you're ...", "..."], "normally": "Normally, you might ...", "steps": ["..."], "key": "...", "why": ["..."], "fits": "...", "enough": "You don't need to ...", "experiment": ["Try it when ..."], "watch": ""}]}"""
 
 PROMPT_GUIDED = """Someone getting into {activity} tried these and wrote what stood out to them:
 {items}
@@ -404,6 +422,12 @@ def ask_json(backend, j: dict | None, prompt: str, step: str, retries: int = 1) 
         except (ValueError, json.JSONDecodeError):
             print(f"  [warn] {step}: couldn't parse JSON (attempt {attempt + 1})", file=sys.stderr)
     raise RuntimeError(f"{step}: the model never returned valid JSON. Last reply:\n{raw}")
+
+
+def log_calls(j: dict, calls: list[dict]) -> None:
+    """Add calls made off to the side (in a background thread) to the journal's log, kept in time order."""
+    j.setdefault("calls", []).extend(calls)
+    j["calls"].sort(key=lambda c: c["time"])
 
 
 def now() -> str:
@@ -614,6 +638,38 @@ def _db():
     return conn
 
 
+_conn = None                    # (url, connection) kept open between statements
+_conn_lock = threading.Lock()   # the page runs each visitor in its own thread
+
+
+def _query(sql: str, params=(), fetch: bool = False):
+    """Run one statement on a connection that stays open: connecting takes several times longer than the
+    statement itself, and the page loads the journal on every click. If the connection has gone stale
+    (the server closed it while idle), reconnect once and run the statement again; every statement here
+    is safe to repeat."""
+    global _conn
+    import psycopg
+    url = database_url()
+    with _conn_lock:
+        for attempt in (1, 2):
+            try:
+                if _conn is None or _conn[0] != url or _conn[1].closed:
+                    if _conn is not None:
+                        _conn[1].close()
+                    _conn = (url, _db())
+                cur = _conn[1].execute(sql, params)
+                return cur.fetchall() if fetch else None
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                if _conn is not None:
+                    try:
+                        _conn[1].close()
+                    except Exception:
+                        pass
+                _conn = None
+                if attempt == 2:
+                    raise
+
+
 def _jsonb(j: dict):
     from psycopg.types.json import Jsonb
     # Postgres jsonb can't hold the NUL character; a model reply could in principle contain one
@@ -623,12 +679,10 @@ def _jsonb(j: dict):
 def save(j: dict) -> None:
     j["updated"] = now()
     if database_url():
-        with _db() as conn:
-            conn.execute(
-                "insert into dtr_journals (slug, key, activity, data, updated) values (%s, %s, %s, %s, now()) "
-                "on conflict (slug) do update set key = excluded.key, activity = excluded.activity, "
-                "data = excluded.data, updated = now()",
-                (j["slug"], j.get("key"), j.get("activity"), _jsonb(j)))
+        _query("insert into dtr_journals (slug, key, activity, data, updated) values (%s, %s, %s, %s, now()) "
+               "on conflict (slug) do update set key = excluded.key, activity = excluded.activity, "
+               "data = excluded.data, updated = now()",
+               (j["slug"], j.get("key"), j.get("activity"), _jsonb(j)))
         return
     d = journals_dir() / j["slug"]
     d.mkdir(parents=True, exist_ok=True)
@@ -640,19 +694,17 @@ def save(j: dict) -> None:
 
 def load(slug: str) -> dict:
     if database_url():
-        with _db() as conn:
-            row = conn.execute("select data from dtr_journals where slug = %s", (slug,)).fetchone()
-        if row is None:
+        rows = _query("select data from dtr_journals where slug = %s", (slug,), fetch=True)
+        if not rows:
             raise FileNotFoundError(f"no journal {slug!r}")
-        return row[0]
+        return rows[0][0]
     return json.loads((journals_dir() / slug / "journal.json").read_text())
 
 
 def list_journals() -> list[str]:
     """Slugs, most recently updated first."""
     if database_url():
-        with _db() as conn:
-            return [r[0] for r in conn.execute("select slug from dtr_journals order by updated desc").fetchall()]
+        return [r[0] for r in _query("select slug from dtr_journals order by updated desc", fetch=True)]
     d = journals_dir()
     if not d.exists():
         return []
@@ -665,9 +717,8 @@ def find_by_key(key: str) -> str | None:
     if not key:
         return None
     if database_url():
-        with _db() as conn:
-            row = conn.execute("select slug from dtr_journals where key = %s", (key,)).fetchone()
-        return row[0] if row else None
+        rows = _query("select slug from dtr_journals where key = %s", (key,), fetch=True)
+        return rows[0][0] if rows else None
     for slug in list_journals():
         try:
             if secrets.compare_digest(str(load(slug).get("key") or ""), key):
@@ -727,6 +778,8 @@ def start(backend, answer: str) -> dict:
     j["questions"] = data["questions"]
     if not j["questions"]:
         build(backend, j)
+    elif PREFETCH_TREE:
+        prefetch_tree(backend, j)   # the tree needs only the activity: build it while they answer
     save(j)
     return j
 
@@ -750,20 +803,52 @@ def answer_questions(backend, j: dict, answers: list[str]) -> dict:
     return j
 
 
-def build(backend, j: dict) -> None:
-    """Step 3: the tree, then the profile located on it, then the first round."""
-    prompt = fill(PROMPT_TREE, activity=j["activity"], v_min=VALUES_RANGE[0], v_max=VALUES_RANGE[1],
+def fetch_tree(backend, activity: str) -> dict:
+    """The tree call (asked again once if the reply is unusable). It reads and writes no journal, so it can
+    run in a background thread; the calls it made come back to be logged by build()."""
+    log = {"calls": []}
+    prompt = fill(PROMPT_TREE, activity=activity, v_min=VALUES_RANGE[0], v_max=VALUES_RANGE[1],
                   p_min=PRINCIPLES_RANGE[0], p_max=PRINCIPLES_RANGE[1], a_min=ACTIONS_RANGE[0], a_max=ACTIONS_RANGE[1])
-    tree, problems = build_tree(ask_json(backend, j, prompt + PROMPT_TREE_FORMAT, "tree"))
+    tree, problems = build_tree(ask_json(backend, log, prompt + PROMPT_TREE_FORMAT, "tree"))
     if problems and (not tree["values"] or len(tree["actions"]) < 6):
         note = "\n\nYour last reply had these problems; fix them: " + "; ".join(problems)
-        tree, problems = build_tree(ask_json(backend, j, prompt + note + PROMPT_TREE_FORMAT, "tree"))
+        tree, problems = build_tree(ask_json(backend, log, prompt + note + PROMPT_TREE_FORMAT, "tree"))
+    return {"tree": tree, "problems": problems, "calls": log["calls"]}
+
+
+_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="dtr")   # trees built ahead, misses, cards
+_trees: dict[str, Future] = {}   # journal key -> its tree, being built ahead of time
+_TREES_KEPT = 200                # trees of people who never came back are dropped, oldest first
+
+
+def prefetch_tree(backend, j: dict) -> None:
+    """Start the tree in the background. build() picks it up; if the server restarted in between, or the
+    call failed, build() simply asks for the tree itself, as before."""
+    while len(_trees) >= _TREES_KEPT:
+        _trees.pop(next(iter(_trees))).cancel()
+    _trees[j["key"]] = _pool.submit(fetch_tree, backend, j["activity"])
+
+
+def build(backend, j: dict) -> None:
+    """Step 3: the tree, then the profile located on it, then the first round."""
+    asked = start_miss(backend, j)      # needs only the profile, so it starts before the tree is in
+    got, ahead = None, _trees.pop(j.get("key"), None)
+    if ahead is not None:
+        try:
+            got = ahead.result()    # waits for whatever is left of the call
+        except Exception as e:      # the early call failed: ask again now
+            print(f"  [warn] tree built ahead failed ({type(e).__name__}); asking again", file=sys.stderr)
+    if got is None:
+        got = fetch_tree(backend, j["activity"])
+    tree, problems = got["tree"], got["problems"]
+    log_calls(j, got["calls"])
     if not tree["actions"]:
         raise RuntimeError("the model didn't return a usable tree: " + "; ".join(problems))
     j["tree"], j["tree_problems"] = tree, problems
     first_words = j["answer"] + "".join(f"\nQ: {x['q']}\nA: {x['a']}" for x in j["qa"])
+    ahead = start_misses(backend, j, asked)   # placed on the tree while the update runs
     j["intake_update"] = update(backend, j, first_words, "intake")
-    plan_round(backend, j)
+    plan_round(backend, j, ahead=ahead)
 
 
 # =============================================================================
@@ -831,26 +916,58 @@ def miss_weight(j: dict) -> float:
     return MISS_WEIGHT / (1 + closed)
 
 
-def ask_misses(backend, j: dict) -> dict[str, float]:
-    """The separate query: what do people like this usually miss? Then locate the answers on the tree."""
+def miss_prompt(j: dict) -> str:
     pr = j["profile"]
-    prompt = fill(PROMPT_MISS, activity=j["activity"], level=pr["level"], level_word=level_word(pr["level"]),
-                  knowledge="; ".join(pr["knowledge"]) or "(nothing said yet)", n=MISSES_ASKED)
-    misses = as_list(ask_json(backend, j, prompt + PROMPT_MISS_FORMAT, "miss").get("misses"))[:MISSES_ASKED]
-    if not misses:
-        return {}
-    prompt = fill(PROMPT_LOCATE, activity=j["activity"], principles=principles_text(j["tree"]),
-                  misses="\n".join(f"{i}. {m}" for i, m in enumerate(misses, 1)))
-    located = ask_json(backend, j, prompt + PROMPT_LOCATE_FORMAT, "locate misses").get("located") or []
+    return fill(PROMPT_MISS, activity=j["activity"], level=pr["level"], level_word=level_word(pr["level"]),
+                knowledge="; ".join(pr["knowledge"]) or "(nothing said yet)", n=MISSES_ASKED) + PROMPT_MISS_FORMAT
+
+
+def ask_miss(backend, prompt: str) -> dict:
+    """The separate query: what do people like this usually miss? It is not shown the tree, so its answers
+    can't lean on the tree's wording. Touches no journal (it runs in a background thread)."""
+    log = {"calls": []}
+    data = ask_json(backend, log, prompt, "miss")
+    return {"misses": as_list(data.get("misses"))[:MISSES_ASKED], "calls": log["calls"]}
+
+
+def locate_misses(backend, activity: str, principles: str, asked) -> dict:
+    """Place the answers on the tree. `asked` is ask_miss()'s result, or the Future that will hold it."""
+    got = asked.result() if isinstance(asked, Future) else asked
+    out = {"misses": got["misses"], "located": [], "calls": list(got["calls"])}
+    if got["misses"]:
+        log = {"calls": []}
+        prompt = fill(PROMPT_LOCATE, activity=activity, principles=principles,
+                      misses="\n".join(f"{i}. {m}" for i, m in enumerate(got["misses"], 1)))
+        located = ask_json(backend, log, prompt + PROMPT_LOCATE_FORMAT, "locate misses").get("located")
+        out["located"] = located if isinstance(located, list) else []
+        out["calls"] += log["calls"]
+    return out
+
+
+def start_miss(backend, j: dict) -> Future:
+    """Ask the query in the background, from the profile as it is right now. Needs no tree."""
+    return _pool.submit(ask_miss, backend, miss_prompt(j))
+
+
+def start_misses(backend, j: dict, asked: Future | None = None) -> Future:
+    """The query (unless `asked` is it, already running) and then its placing on the tree, in the
+    background. plan_round() collects the result."""
+    return _pool.submit(locate_misses, backend, j["activity"], principles_text(j["tree"]),
+                        asked or start_miss(backend, j))
+
+
+def miss_scores(j: dict, got: dict) -> dict[str, float]:
+    """Principle id -> 0..1: how much of what people like this miss falls under it (earlier = more important)."""
+    log_calls(j, got["calls"])
+    misses = j["last_misses"] = got["misses"]
     scores: dict[str, float] = {}
-    for item in located:
+    for item in got["located"]:
         if not isinstance(item, dict):
             continue
         pid, i = item.get("principle"), item.get("item")
         if pid in j["tree"]["principles"] and isinstance(i, int) and 1 <= i <= len(misses):
-            scores[pid] = scores.get(pid, 0) + (len(misses) - i + 1) / len(misses)   # earlier = more important
+            scores[pid] = scores.get(pid, 0) + (len(misses) - i + 1) / len(misses)
     top = max(scores.values(), default=0) or 1
-    j["last_misses"] = misses
     return {pid: s / top for pid, s in scores.items()}
 
 
@@ -917,8 +1034,10 @@ def shortlist(j: dict, ranked: list[tuple[str, float]], exclude=()) -> list[tupl
     return [(a, pid) for a, (_, pid) in order[:SHORTLIST]]
 
 
-def choose(backend, j: dict, short: list[tuple[str, str]], n: int) -> list[tuple[str, str, str]]:
-    """The model picks n from the shortlist using the misc details. Falls back to the top of the list."""
+def choose(backend, j: dict, short: list[tuple[str, str]], n: int, taken=()) -> list[tuple[str, str, str, str]]:
+    """The model picks n from the shortlist using the misc details, and gives each a moment for its card
+    (different from each other and from `taken`, the moments of cards already in the round). Returns
+    (action, principle, why, moment). Falls back to the top of the list."""
     if n <= 0 or not short:
         return []
     tree = j["tree"]
@@ -928,66 +1047,97 @@ def choose(backend, j: dict, short: list[tuple[str, str]], n: int) -> list[tuple
         lines.append(f"[{aid}] {a['name']}: {a['what']} (part of {tree['principles'][pid]['name']}; "
                      f"needs experience {a['overall']}/10 overall, {a['principle']}/10 in that part; "
                      f"impact {a.get('impact', 5)}/10)")
-    prompt = fill(PROMPT_CHOOSE, activity=j["activity"], profile=profile_text(j), shortlist="\n".join(lines), n=n)
+    also = ("" if not taken else ", and from these moments, which they are already being given:\n"
+            + "\n".join(f"- {m}" for m in taken))
+    prompt = fill(PROMPT_CHOOSE, activity=j["activity"], profile=profile_text(j), shortlist="\n".join(lines), n=n,
+                  taken=also)
     by_id = dict(short)
     picked = []
     try:
         for c in ask_json(backend, j, prompt + PROMPT_CHOOSE_FORMAT, "choose").get("chosen") or []:
             if isinstance(c, dict) and c.get("id") in by_id and c["id"] not in [p[0] for p in picked]:
-                picked.append((c["id"], by_id[c["id"]], str(c.get("why") or "")))
+                picked.append((c["id"], by_id[c["id"]], str(c.get("why") or ""), str(c.get("moment") or "").strip()))
     except RuntimeError:
         pass
     for aid, pid in short:
         if len(picked) >= n:
             break
         if aid not in [p[0] for p in picked]:
-            picked.append((aid, pid, "top of the shortlist"))
+            picked.append((aid, pid, "top of the shortlist", ""))
     return picked[:n]
 
 
-def expand(backend, j: dict, aids: list[str]) -> dict[str, dict]:
-    """Write each action up as a card."""
+def last_scene(j: dict, aid: str) -> str:
+    """The scene of the card this action had the last time it was given (a retry stays in that moment)."""
+    for rnd in reversed(j["rounds"]):
+        for c in rnd["cards"]:
+            if c["action"] == aid:
+                return " ".join(as_list(c["card"].get("scene"))) or c.get("moment", "")
+    return ""
+
+
+def expand(backend, j: dict, aids: list[str], moments: dict[str, str] | None = None) -> dict[str, dict]:
+    """Write each action up as a card: one call per card, all at the same time. Every call is given the
+    whole list of actions for this round, with the moment each card is set in, and writes one of them."""
+    moments = moments or {}
     tree = j["tree"]
     items = []
     for aid in aids:
         a = tree["actions"][aid]
         called = f' (people call it "{a["called"]}")' if a.get("called") else ""
-        items.append(f"[{aid}] {a['name']}{called}: {a['what']} Why: {a['why']}")
-    prompt = fill(PROMPT_EXPAND, activity=j["activity"], profile=profile_text(j), items="\n".join(items))
+        moment = f"\n    Moment: {moments[aid]}" if moments.get(aid) else ""
+        items.append(f"[{aid}] {a['name']}{called}: {a['what']} Why: {a['why']}{moment}")
+    others = " only (the others are being written up separately)" if len(aids) > 1 else ""
+    profile = profile_text(j)
+
+    def one(aid: str) -> tuple[dict | None, list[dict]]:
+        log, card = {"calls": []}, None
+        try:
+            prompt = fill(PROMPT_EXPAND, activity=j["activity"], profile=profile, items="\n".join(items),
+                          this=f"[{aid}]", others=others)
+            got = ask_json(backend, log, prompt + PROMPT_EXPAND_FORMAT, f"expand ({aid})")
+            written = [c for c in got.get("cards") or [] if isinstance(c, dict)]
+            card = next((c for c in written if c.get("id") == aid), written[0] if len(written) == 1 else None)
+        except RuntimeError:
+            pass
+        return card, log["calls"]
+
     cards = {}
-    try:
-        for c in ask_json(backend, j, prompt + PROMPT_EXPAND_FORMAT, "expand").get("cards") or []:
-            if isinstance(c, dict) and c.get("id") in aids:
-                cards[c["id"]] = c
-    except RuntimeError:
-        pass
-    for aid in aids:   # a card that didn't come back keeps the tree's own short write-up
-        if aid not in cards:
+    for aid, (card, calls) in zip(aids, list(_pool.map(one, aids))):
+        log_calls(j, calls)
+        if card is None:   # a card that didn't come back keeps the tree's own short write-up
             a = tree["actions"][aid]
-            cards[aid] = {"id": aid, "title": a["name"],
-                          "called": f'This is called "{a["called"]}": {a["what"]}' if a.get("called") else "", "steps": [a["what"]], "why": [a["why"]]}
+            card = {"title": a["name"], "called": f'This is called "{a["called"]}": {a["what"]}' if a.get("called") else "",
+                    "steps": [a["what"]], "why": [a["why"]]}
+        cards[aid] = {**card, "id": aid}
     return cards
 
 
-def plan_round(backend, j: dict, retries: list[dict] | None = None) -> dict:
-    """Steps 4-5: score, shortlist, choose, write up. Retries (failed actions with a reply) go first."""
+def plan_round(backend, j: dict, retries: list[dict] | None = None, ahead: Future | None = None) -> dict:
+    """Steps 4-5: score, shortlist, choose, write up. Retries (failed actions with a reply) go first.
+    `ahead` is the "usually miss" query already running in the background (start_misses), if it is."""
     retries = [r for r in (retries or []) if available(j, r["action"])][:CARDS]
-    misses = ask_misses(backend, j)
+    misses = miss_scores(j, ahead.result() if ahead is not None else locate_misses(
+        backend, j["activity"], principles_text(j["tree"]), ask_miss(backend, miss_prompt(j))))
     ranked = score_principles(j, misses)
     short = shortlist(j, ranked, exclude=[r["action"] for r in retries])
     n_new = max(CARDS - len(retries), MIN_CARDS - len(retries), 0)
-    picked = choose(backend, j, short, n_new)
+    moments = {r["action"]: last_scene(j, r["action"]) for r in retries}
+    picked = choose(backend, j, short, n_new, taken=[m for m in moments.values() if m])
+    moments.update({aid: moment for aid, _, _, moment in picked})
     aids = [r["action"] for r in retries] + [p[0] for p in picked]
-    cards = expand(backend, j, aids)
+    cards = expand(backend, j, aids, moments)
     number = len(j["rounds"]) + 1
     rnd = {"number": number, "opened": now(), "closed": None, "lambda": round(miss_weight(j), 3),
            "misses": j.get("last_misses", []), "scores": ranked, "general": "", "summary": None, "cards": []}
     for r in retries:
         rnd["cards"].append({"action": r["action"], "principle": r["principle"], "why_chosen": "retry",
+                             "moment": moments[r["action"]],
                              "retry": True, "reply": r["reply"], "card": cards[r["action"]],
                              "free": "", "guided_q": [], "guided_a": [], "outcome": None, "note": ""})
-    for aid, pid, why in picked:
-        rnd["cards"].append({"action": aid, "principle": pid, "why_chosen": why, "retry": False, "reply": "",
+    for aid, pid, why, moment in picked:
+        rnd["cards"].append({"action": aid, "principle": pid, "why_chosen": why, "moment": moment,
+                             "retry": False, "reply": "",
                              "card": cards[aid], "free": "", "guided_q": [], "guided_a": [], "outcome": None,
                              "note": ""})
     for c in rnd["cards"]:
@@ -1036,6 +1186,7 @@ def card_report(c: dict, tree: dict) -> str:
 
 def close_round(backend, j: dict) -> dict:
     rnd, tree = current_round(j), j["tree"]
+    ahead = start_misses(backend, j)    # for the next round, alongside the assessment and the update
     items = "\n\n".join(card_report(c, tree) for c in rnd["cards"])
     if rnd["general"]:
         items += f"\n\nIn general, apart from these, they wrote: {rnd['general']}"
@@ -1071,7 +1222,7 @@ def close_round(backend, j: dict) -> dict:
             retries = [r for r in retries if r["action"] != c["action"]]
     j["boost"] = [pid for pid in j["boost"] if coverage(j, pid) < 1.0]
     rnd["summary"], rnd["closed"] = summary, now()
-    plan_round(backend, j, retries)
+    plan_round(backend, j, retries, ahead)
     save(j)
     return summary
 

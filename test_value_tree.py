@@ -205,6 +205,105 @@ def test_high_impact_action_can_outrank_a_slightly_needier_principle():
     assert order.index(high) < order.index(low)
 
 
+def test_tree_is_built_while_the_questions_are_answered():
+    b = MockBackend()
+    j = vt.start(b, "I'm getting into it. I already do the obvious thing.")
+    assert j["questions"] and j["tree"] is None
+    ahead = vt._trees[j["key"]]                      # started by start(), before any answer
+    assert ahead.result()["tree"]["actions"]
+    vt.answer_questions(b, j, ["About a month, twice a week."])
+    assert b.calls["tree"] == 1, "the tree built ahead is used, not asked for again"
+    assert j["key"] not in vt._trees
+    steps = [c["step"] for c in j["calls"]]
+    assert steps.count("tree") == 1 and steps.index("tree") < steps.index("update (intake)")
+    # same tree, cards and prompts as when nothing is built ahead
+    assert plain_run(vt.PREFETCH_TREE) == plain_run(False)
+
+
+def plain_run(prefetch):
+    old, vt.PREFETCH_TREE = vt.PREFETCH_TREE, prefetch
+    try:
+        _, j = started()
+    finally:
+        vt.PREFETCH_TREE = old
+    return (j["tree"], [c["card"] for c in j["rounds"][0]["cards"]],
+            sorted((c["step"], c["prompt"], c["raw"]) for c in j["calls"]))
+
+
+def test_miss_query_never_sees_the_tree_and_each_card_is_its_own_call():
+    b, j = started()
+    cards = vt.current_round(j)["cards"]
+    assert b.calls["miss"] == 1 and b.calls["locate misses"] == 1
+    assert b.calls["expand"] == len(cards)
+    steps = [c["step"] for c in j["calls"]]
+    assert sorted(s for s in steps if s.startswith("expand")) == sorted(f"expand ({c['action']})" for c in cards)
+    miss = next(c for c in j["calls"] if c["step"] == "miss")
+    locate = next(c for c in j["calls"] if c["step"] == "locate misses")
+    names = [p["name"] for p in j["tree"]["principles"].values()]
+    assert not any(n in miss["prompt"] for n in names), "the question is asked without the tree in view"
+    assert all(n in locate["prompt"] for n in names)
+    assert vt.current_round(j)["misses"] and all(c["card"]["id"] == c["action"] for c in cards)
+    give_feedback(b, j, {})
+    assert b.calls["miss"] == 2 and b.calls["expand"] == len(cards) + len(vt.current_round(j)["cards"])
+
+
+def test_every_card_call_is_given_every_cards_moment():
+    b, j = started()
+    cards = vt.current_round(j)["cards"]
+    moments = [c["moment"] for c in cards]
+    assert all(moments) and len(set(moments)) == len(moments), "the choose call gives each card its own moment"
+    for call in (c for c in j["calls"] if c["step"].startswith("expand")):
+        assert all(f"Moment: {m}" in call["prompt"] for m in moments)
+    # a retried action keeps the scene it had, and the newly chosen ones are told to stay clear of it
+    first = cards[0]["action"]
+    give_feedback(b, j, {first: "I was scared to."})
+    again = next(c for c in vt.current_round(j)["cards"] if c["action"] == first)
+    assert again["retry"] and again["moment"] == "Imagine you're there."
+    choose = [c for c in j["calls"] if c["step"] == "choose"][-1]
+    assert "- Imagine you're there." in choose["prompt"]
+    new_cards = [c for c in j["calls"] if c["step"].startswith("expand")][-len(vt.current_round(j)["cards"]):]
+    assert all("Moment: Imagine you're there." in c["prompt"] for c in new_cards)
+
+
+def test_miss_query_reads_the_profile_from_before_the_update():
+    b, j = started()
+    j["profile"]["knowledge"].append("a line known before this round closed")
+    real_update = vt.update
+
+    def update_adding_a_line(backend, jj, new_text, why):
+        jj["profile"]["knowledge"].append("a line the update added")
+        return real_update(backend, jj, new_text, why)
+
+    vt.update = update_adding_a_line
+    try:
+        give_feedback(b, j, {})
+    finally:
+        vt.update = real_update
+    miss = [c for c in j["calls"] if c["step"] == "miss"][-1]
+    assert "a line known before this round closed" in miss["prompt"]
+    assert "a line the update added" not in miss["prompt"]
+
+
+def test_a_card_that_fails_keeps_the_trees_write_up():
+    b, j = started()
+    real = b.complete
+    b.complete = lambda prompt, step="", max_tokens=0: "not json" if step.startswith("expand") else real(prompt, step)
+    give_feedback(b, j, {})
+    for c in vt.current_round(j)["cards"]:
+        assert c["card"]["id"] == c["action"] and c["card"]["title"] == j["tree"]["actions"][c["action"]]["name"]
+
+
+def test_a_failed_early_tree_is_asked_for_again():
+    b = MockBackend()
+    j = vt.start(b, "I'm getting into it. I already do the obvious thing.")
+    vt._trees[j["key"]].result()
+    failed = vt.Future()
+    failed.set_exception(RuntimeError("network"))
+    vt._trees[j["key"]] = failed
+    vt.answer_questions(b, j, ["About a month, twice a week."])
+    assert b.calls["tree"] == 2 and j["tree"]["actions"] and vt.current_round(j)["cards"]
+
+
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="set TEST_DATABASE_URL to test the Postgres store")
 def test_postgres_store(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", os.environ["TEST_DATABASE_URL"])
@@ -221,3 +320,10 @@ def test_postgres_store(monkeypatch):
     assert len(vt.export_all()) == 2
     with pytest.raises(FileNotFoundError):
         vt.load("missing")
+    # the connection is kept open between statements, and replaced when the server has dropped it
+    kept = vt._conn[1]
+    vt.load(j["slug"])
+    assert vt._conn[1] is kept
+    with vt._db() as other:
+        other.execute("select pg_terminate_backend(%s)", (kept.info.backend_pid,))
+    assert vt.load(j["slug"])["key"] == j["key"] and vt._conn[1] is not kept
